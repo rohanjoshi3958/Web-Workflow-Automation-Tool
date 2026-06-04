@@ -2,8 +2,7 @@
 """
 UI Navigator Agent - Main Entry Point
 
-Run tasks directly from command line.
-No configuration files needed - just provide the task and URL!
+Claude + Playwright MCP browser agent. Provide a task and optional URL/credentials.
 """
 
 import sys
@@ -20,7 +19,7 @@ async def run_task(task, app_url=None, credentials=None):
     if credentials is None:
         credentials = {}
     
-    orchestrator = Orchestrator('./screenshots')
+    orchestrator = Orchestrator('./runs')
     
     try:
         await orchestrator.initialize()
