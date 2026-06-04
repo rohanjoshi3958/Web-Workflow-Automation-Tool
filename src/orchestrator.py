@@ -28,5 +28,7 @@ class Orchestrator:
             print(f"\nRun logs: {result.get('run_dir')}")
         else:
             print(f"\nTask failed: {result.get('error')}")
+            if result.get('error_detail'):
+                print('\nDetails:\n' + result['error_detail'])
 
         return result

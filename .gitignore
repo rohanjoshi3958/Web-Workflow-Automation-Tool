@@ -19,6 +19,11 @@ ENV/
 runs/
 screenshots/
 
+# Playwright MCP snapshot files
+**/snap_*.md
+**/snapshot_*.md
+**/page-*.yml
+
 # OS
 .DS_Store
 
