@@ -29,15 +29,31 @@ ALLOWED_MCP_TOOLS = frozenset({
 
 SYSTEM_PROMPT = """You are a UI automation agent with Playwright browser tools.
 
-Rules:
-- Work step by step. Be concise in text replies; prefer acting over narrating.
-- browser_snapshot: always pass filename (e.g. snap_01.md) and depth: 6. Snapshots are saved to disk only—you cannot read those files. Use the small tool response, not re-snapshotting to "check" the page.
-- Autocomplete: click field → browser_type value → browser_wait_for if needed → browser_click the suggestion text OR ArrowDown then Enter. Do not loop snapshots.
-- Dates: if required but not given by the user, pick dates ~2–4 weeks out (range +3–7 days for round trips), click them in the calendar, confirm (Done/Apply/Search), continue until real results/listings appear—not only a price calendar grid.
-- Login only when required; use provided credentials or ask the user to log in manually in the visible browser.
+Ground truth (critical—reduces hallucination):
+- Only describe UI elements, page state, or success if the latest tool result supports it. Never invent buttons, dropdown items, prices, or "I can see…" without evidence.
+- If you do not know what is on screen, call browser_snapshot WITHOUT filename and depth 5 first—then act from that result.
+- After click/type/navigate, verify with browser_wait_for (time 1–2, or text/textGone) before claiming the step worked.
+- In the final summary, list only steps you actually performed via tools—not what "should" happen.
+
+Snapshots:
+- Decision points (forms, login, autocomplete, picking what to click): browser_snapshot with NO filename, depth 5—read the returned tree, then act.
+- Huge pages only (full calendars, long result lists): filename (e.g. snap_01.md) and depth 8—do not describe their contents; use smaller inline snapshot (depth 5) if you need to click something there.
+- Do not snapshot the same unchanged view twice in a row.
+
+Actions:
+- Work step by step. Minimal text; prefer tools over narration.
+- Autocomplete: type → wait → click suggestion text OR ArrowDown + Enter.
+- Dates: if not given, pick ~2–4 weeks out (range +3–7 days); complete the flow through real results, not only a calendar grid.
 - Do not use browser_take_screenshot.
 
-When done, summarize what you accomplished and stop calling tools."""
+Login (any website):
+- Use provided Login email/password if given.
+- Otherwise at sign-in: tell user to log in, browser_wait_for for Manual login wait seconds, stay on same site, then continue.
+- Never treat login screen as task completion.
+
+When unsure what to click: try one reasonable alternative (synonym button, Enter, ArrowDown)—do not invent what is on the page. After 2–3 failed attempts, say what you tried and what blocked you.
+
+When done, summarize verified results only and stop calling tools."""
 
 
 def _root_error(error: BaseException) -> BaseException:
@@ -82,8 +98,10 @@ class BrowserAgent:
         self.run_dir = Path(run_dir)
         self.max_iterations = int(os.getenv('AGENT_MAX_ITERATIONS', '40'))
         self.max_tokens = int(os.getenv('AGENT_MAX_TOKENS', '2048'))
+        self.temperature = float(os.getenv('AGENT_TEMPERATURE', '0'))
         self.headless = os.getenv('HEADLESS', '').lower() in {'1', 'true', 'yes'}
         self.rate_limit_retries = int(os.getenv('RATE_LIMIT_RETRIES', '2'))
+        self.manual_login_wait_seconds = int(os.getenv('MANUAL_LOGIN_WAIT_SECONDS', '180'))
         self.mcp_command = os.getenv('MCP_COMMAND', 'npx')
         self.mcp_args_prefix = os.getenv(
             'MCP_ARGS',
@@ -115,12 +133,41 @@ class BrowserAgent:
             for phrase in ('today', 'tomorrow', 'next week', 'next month', 'this weekend')
         )
 
+    def _extract_emails(self, task: str) -> list[str]:
+        return re.findall(r'[\w.+-]+@[\w.-]+\.\w+', task)
+
+    def _is_email_send_task(self, task: str) -> bool:
+        task_lower = task.lower()
+        return bool(
+            re.search(r'\b(send|compose|write|draft)\b', task_lower)
+            and re.search(r'\b(email|e-mail|mail|gmail|outlook)\b', task_lower)
+        ) or ('@' in task and re.search(r'\bsend\b', task_lower))
+
+    def _has_login_credentials(self, credentials: dict) -> bool:
+        return bool(credentials.get('email') and credentials.get('password'))
+
     def _build_user_prompt(self, task, app_url=None, credentials=None):
         credentials = credentials or {}
         parts = [f'Task: {task}', f"Today: {date.today().isoformat()}"]
+        parts.append(
+            'Do not claim success unless a tool result confirms it. '
+            'Use inline browser_snapshot (no filename, depth 5) before choosing what to click.'
+        )
 
         if app_url:
             parts.append(f'URL: {app_url}')
+        elif self._is_email_send_task(task):
+            parts.append('URL: https://mail.google.com')
+
+        recipients = self._extract_emails(task)
+        if recipients:
+            parts.append(f'Email recipient(s) to use in To field: {", ".join(recipients)}')
+
+        if self._is_email_send_task(task):
+            parts.append(
+                'Complete the send in the web UI: open compose, fill To/Subject/Body, click Send. '
+                'Use a short subject and body if the user did not specify them.'
+            )
 
         if not self._task_specifies_dates(task):
             parts.append(
@@ -131,6 +178,13 @@ class BrowserAgent:
             parts.append(f'Login email: {credentials["email"]}')
         if credentials.get('password'):
             parts.append(f'Login password: {credentials["password"]}')
+
+        if not self._has_login_credentials(credentials):
+            parts.append(
+                f'Manual login wait seconds: {self.manual_login_wait_seconds}. '
+                'On any login/sign-in page without credentials above: stop, wait for the user '
+                f'to log in (browser_wait_for time={self.manual_login_wait_seconds}), then continue.'
+            )
 
         return '\n'.join(parts)
 
@@ -175,11 +229,23 @@ class BrowserAgent:
         return final_text, turns
 
     async def run_task(self, task, app_url=None, credentials=None):
+        credentials = credentials or {}
         run_folder = self._create_run_folder()
         user_prompt = self._build_user_prompt(task, app_url, credentials)
 
         print(f'Run logs: {run_folder}')
         print('Starting Playwright MCP browser agent...\n')
+
+        if not self._has_login_credentials(credentials):
+            if self.headless:
+                print(
+                    'Warning: HEADLESS=true — manual login will not work. '
+                    'Set HEADLESS=false or pass login email and password on the command line.\n'
+                )
+            print(
+                f'If any site shows login/sign-in, log in in the browser window. '
+                f'The agent will wait up to {self.manual_login_wait_seconds} seconds.\n'
+            )
 
         final_text = ''
         turns = 0
@@ -195,7 +261,7 @@ class BrowserAgent:
                     runner = self.client.beta.messages.tool_runner(
                         model=self.model,
                         max_tokens=self.max_tokens,
-                        temperature=0.2,
+                        temperature=self.temperature,
                         max_iterations=self.max_iterations,
                         system=SYSTEM_PROMPT,
                         messages=[{'role': 'user', 'content': user_prompt}],
